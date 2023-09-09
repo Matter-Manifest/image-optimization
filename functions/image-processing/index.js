@@ -4,77 +4,73 @@
 const AWS = require("aws-sdk");
 const https = require("https");
 const Sharp = require("sharp");
+const Sentry = require("@sentry/serverless");
 
-const S3 = new AWS.S3({
-  signatureVersion: "v4",
-  httpOptions: { agent: new https.Agent({ keepAlive: true }) },
-});
 const S3_ORIGINAL_IMAGE_BUCKET = process.env.originalImageBucketName;
 const S3_TRANSFORMED_IMAGE_BUCKET = process.env.transformedImageBucketName;
 const TRANSFORMED_IMAGE_CACHE_TTL = process.env.transformedImageCacheTTL;
 const SECRET_KEY = process.env.secretKey;
 const LOG_TIMING = process.env.logTiming;
 
-exports.handler = async (event) => {
-  // First validate if the request is coming from CloudFront
-  if (
-    !event.headers["x-origin-secret-header"] ||
-    !(event.headers["x-origin-secret-header"] === SECRET_KEY)
-  )
-    return sendError(403, "Request unauthorized", event);
-  // Validate if this is a GET request
-  if (
-    !event.requestContext ||
-    !event.requestContext.http ||
-    !(event.requestContext.http.method === "GET")
-  )
-    return sendError(400, "Only GET method is supported", event);
-  // An example of expected path is /images/rio/1.jpeg/format=auto,width=100 or /images/rio/1.jpeg/original where /images/rio/1.jpeg is the path of the original image
-  var imagePathArray = event.requestContext.http.path.split("/");
-  // get the requested image operations
-  var operationsPrefix = imagePathArray.pop();
-  // get the original image path images/rio/1.jpg
-  imagePathArray.shift();
-  var originalImagePath = imagePathArray.join("/");
-  // timing variable
-  var timingLog = "perf ";
-  var startTime = performance.now();
-  // Downloading original image
-  let originalImage;
-  let contentType;
+const S3 = new AWS.S3({
+  signatureVersion: "v4",
+  httpOptions: { agent: new https.Agent({ keepAlive: true }) },
+});
+
+Sentry.AWSLambda.init({
+  dsn: "https://dc3fa9fd27fdf0cb59e7ef827efaba34@o4505573403459584.ingest.sentry.io/4505848318590976",
+  integrations: [],
+  // Performance Monitoring
+  tracesSampleRate: 0.1, // Capture 100% of the transactions, reduce in production!
+  // Set sampling rate for profiling - this is relative to tracesSampleRate
+  profilesSampleRate: 0.1, // Capture 100% of the transactions, reduce in production!
+});
+
+async function getOriginalImage(originalImagePath) {
   try {
-    originalImage = await S3.getObject({
+    const originalImage = await S3.getObject({
       Bucket: S3_ORIGINAL_IMAGE_BUCKET,
       Key: originalImagePath,
     }).promise();
-    contentType = originalImage.ContentType;
+    const contentType = originalImage.ContentType;
+    return { originalImage, contentType };
   } catch (error) {
-    return sendError(404, "", error);
+    console.error("Specified Image does not exist", originalImagePath);
+    Sentry.captureException(error, {
+      extra: {
+        file: originalImagePath,
+      },
+    });
+    return null;
   }
-  //  execute the requested operations
-  const operationsJSON = Object.fromEntries(
-    operationsPrefix.split(",").map((operation) => operation.split("="))
-  );
+}
 
-  let transformedImage = Sharp(originalImage.Body, {
-    failOn: "none",
-    animated: true,
-  });
-  // Get image orientation to rotate if needed
-  const imageMetadata = await transformedImage.metadata();
-
-  timingLog = timingLog + parseInt(performance.now() - startTime) + " ";
-  startTime = performance.now();
+async function transformImage({
+  originalImage,
+  operationsJSON,
+  contentType,
+  originalImagePath,
+}) {
   try {
+    let transformedImage = Sharp(originalImage.Body, {
+      failOn: "none",
+      // make sure gifs and animated webp work
+      animated: true,
+    });
+    // Get image orientation to rotate if needed
+    const imageMetadata = await transformedImage.metadata();
+
     // check if resizing is requested
-    var resizingOptions = {};
+    var resizingOptions = {
+      width: undefined,
+      height: undefined,
+    };
     if (operationsJSON["width"])
       resizingOptions.width = parseInt(operationsJSON["width"]);
     if (operationsJSON["height"])
       resizingOptions.height = parseInt(operationsJSON["height"]);
     if (resizingOptions)
       transformedImage = transformedImage.resize(resizingOptions);
-    // check if rotation is needed
     if (imageMetadata.orientation) transformedImage = transformedImage.rotate();
     // check if formatting is requested
     if (operationsJSON["format"]) {
@@ -115,11 +111,22 @@ exports.handler = async (event) => {
     }
     transformedImage = await transformedImage.toBuffer();
   } catch (error) {
-    return sendError(500, "error transforming image", error);
+    console.error("Failed to transform image", originalImagePath);
+    Sentry.captureException(error, {
+      extra: {
+        file: originalImagePath,
+      },
+    });
+    return null;
   }
-  timingLog = timingLog + parseInt(performance.now() - startTime) + " ";
-  startTime = performance.now();
-  // upload transformed image back to S3 if required in the architecture
+}
+
+async function uploadTransformedImage({
+  transformedImage,
+  originalImagePath,
+  operationsPrefix,
+  contentType,
+}) {
   if (S3_TRANSFORMED_IMAGE_BUCKET) {
     try {
       await S3.putObject({
@@ -132,15 +139,82 @@ exports.handler = async (event) => {
         },
       }).promise();
     } catch (error) {
-      sendError(
-        "APPLICATION ERROR",
-        "Could not upload transformed image to S3",
-        error
-      );
+      console.error("Failed to upload transformed image", originalImagePath);
+      Sentry.captureException(error, {
+        extra: {
+          file: originalImagePath,
+        },
+      });
+      return null;
     }
   }
-  timingLog = timingLog + parseInt(performance.now() - startTime) + " ";
-  if (LOG_TIMING === "true") console.log(timingLog);
+  return true;
+}
+
+exports.handler = async (event) => {
+  // First validate if the request is coming from CloudFront
+  if (
+    !event.headers["x-origin-secret-header"] ||
+    !(event.headers["x-origin-secret-header"] === SECRET_KEY)
+  ) {
+    return { message: "Request unauthorized", statusCode: 401 };
+  }
+  // Validate if this is a GET request
+  if (
+    !event.requestContext?.http ||
+    !(event.requestContext.http.method === "GET")
+  ) {
+    return { message: "Only GET method is supported", statusCode: 400 };
+  }
+
+  // An example of expected path is /images/rio/1.jpeg/format=auto,width=100 or /images/rio/1.jpeg/original where /images/rio/1.jpeg is the path of the original image
+  var imagePathArray = event.requestContext.http.path.split("/");
+  // get the requested image operations
+  var operationsPrefix = imagePathArray.pop();
+  // get the original image path images/rio/1.jpg
+  imagePathArray.shift();
+  var originalImagePath = imagePathArray.join("/");
+
+  const originalImageResponse = await getOriginalImage(originalImagePath);
+  if (!originalImageResponse) {
+    return { statusCode: 404 };
+  }
+  const { originalImage, contentType } = originalImageResponse;
+
+  //  execute the requested operations
+  const operationsJSON = Object.fromEntries(
+    operationsPrefix.split(",").map((operation) => operation.split("="))
+  );
+
+  if (originalImagePath.endsWith(".gcode")) {
+    return {
+      statusCode: 200,
+      body: originalImage.toString("base64"),
+      isBase64Encoded: true,
+      headers: {
+        "Content-Type": contentType,
+      },
+    };
+  }
+
+  const transformedImage = await transformImage({
+    originalImage,
+    operationsJSON,
+    contentType,
+    originalImagePath,
+  });
+  if (!transformedImage) {
+    return {
+      statusCode: 500,
+    };
+  }
+  // upload transformed image back to S3 if required in the architecture
+  await uploadTransformedImage({
+    transformedImage,
+    originalImagePath,
+    operationsPrefix,
+    contentType,
+  });
   // return transformed image
   return {
     statusCode: 200,
@@ -152,9 +226,3 @@ exports.handler = async (event) => {
     },
   };
 };
-
-function sendError(statusCode, body, error) {
-  console.log("APPLICATION ERROR", body);
-  console.log(error);
-  return { statusCode, body };
-}
