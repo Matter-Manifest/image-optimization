@@ -67,6 +67,14 @@ async function getOriginalImage(originalImagePath) {
   }
 }
 
+const streamToBuffer = (stream) =>
+  new Promise((resolve, reject) => {
+    const chunks = [];
+    stream.on("data", (chunk) => chunks.push(chunk));
+    stream.on("error", reject);
+    stream.on("end", () => resolve(Buffer.concat(chunks)));
+  });
+
 async function transformImage({
   originalImage,
   operationsJSON,
@@ -75,7 +83,8 @@ async function transformImage({
 }) {
   try {
     console.log("[transformImage] beginning transform");
-    let transformedImage = Sharp(originalImage.Body, {
+    const bufferData = await streamToBuffer(originalImage.Body);
+    let transformedImage = Sharp(bufferData, {
       failOn: "none",
       // make sure gifs and animated webp work
       animated: true,
