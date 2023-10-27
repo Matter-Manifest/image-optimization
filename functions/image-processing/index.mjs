@@ -1,15 +1,20 @@
-// Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
-// SPDX-License-Identifier: MIT-0
+import Sharp from "sharp";
 
-const AWS = require("aws-sdk");
-const https = require("https");
-const Sharp = require("sharp");
-const Sentry = require("@sentry/serverless");
+import {
+  S3Client,
+  GetObjectCommand,
+  PutObjectCommand,
+} from "@aws-sdk/client-s3";
+
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+
+import * as Sentry from "@sentry/serverless";
 
 const S3_ORIGINAL_IMAGE_BUCKET = process.env.originalImageBucketName;
 const S3_TRANSFORMED_IMAGE_BUCKET = process.env.transformedImageBucketName;
-const TRANSFORMED_IMAGE_CACHE_TTL = process.env.transformedImageCacheTTL;
+const TRANSFORMED_IMAGE_CACHE_TTL = process.env.transformedImageCacheTTL || "0";
 const SECRET_KEY = process.env.secretKey;
+const shouldValidate = false;
 
 Sentry.AWSLambda.init({
   dsn: "https://dc3fa9fd27fdf0cb59e7ef827efaba34@o4505573403459584.ingest.sentry.io/4505848318590976",
@@ -20,37 +25,37 @@ Sentry.AWSLambda.init({
   profilesSampleRate: 0.1, // Capture 100% of the transactions, reduce in production!
 });
 
-let S3;
-
-function initS3() {
-  try {
-    console.log("init S3");
-    S3 = new AWS.S3({
-      signatureVersion: "v4",
-      httpOptions: { agent: new https.Agent({ keepAlive: true }) },
-    });
-  } catch (error) {
-    console.error("Failed to init S3");
-    throw error;
-  }
-}
+let client = new S3Client({ region: process.env.AWS_REGION });
 
 async function getOriginalImage(originalImagePath) {
   try {
+    // Only used for the gcode files cuz theyre too large to return via the lambda itself
+    let presignedUrl;
     console.log(
-      "getting original image " +
+      "[getOriginalImage] getting original image " +
         originalImagePath +
         " from " +
         S3_ORIGINAL_IMAGE_BUCKET
     );
-    const originalImage = await S3.getObject({
+    const command = new GetObjectCommand({
       Bucket: S3_ORIGINAL_IMAGE_BUCKET,
       Key: originalImagePath,
-    }).promise();
+    });
+    const originalImage = await client.send(command);
     const contentType = originalImage.ContentType;
-    return { originalImage, contentType };
+    console.log(
+      "[getOriginalImage] original image content type:" + contentType
+    );
+    if (contentType === "binary/octet-stream") {
+      // need these for the large files that are bigger than the 6MB limit that lambdas allow for returning data
+      presignedUrl = await getSignedUrl(client, command, { expiresIn: 3600 });
+    }
+    return { originalImage, contentType, presignedUrl };
   } catch (error) {
-    console.error("Specified Image does not exist", originalImagePath);
+    console.error(
+      "[getOriginalImage] Specified Image does not exist",
+      originalImagePath
+    );
     console.error(error);
     Sentry.captureException(error, {
       extra: {
@@ -69,7 +74,7 @@ async function transformImage({
   originalImagePath,
 }) {
   try {
-    console.log("beginning transform");
+    console.log("[transformImage] beginning transform");
     let transformedImage = Sharp(originalImage.Body, {
       failOn: "none",
       // make sure gifs and animated webp work
@@ -127,10 +132,13 @@ async function transformImage({
       } else
         transformedImage = transformedImage.toFormat(operationsJSON["format"]);
     }
-    transformedImage = await transformedImage.toBuffer();
-    return transformedImage;
+    const bufferTransformedImage = await transformedImage.toBuffer();
+    return bufferTransformedImage;
   } catch (error) {
-    console.error("Failed to transform image", originalImagePath);
+    console.error(
+      "[transformImage] Failed to transform image",
+      originalImagePath
+    );
     console.error(error);
     Sentry.captureException(error, {
       extra: {
@@ -147,21 +155,26 @@ async function uploadTransformedImage({
   operationsPrefix,
   contentType,
 }) {
-  console.log("Uploading transformed image");
+  console.log("[uploadTransformedImage] Uploading transformed image");
   if (S3_TRANSFORMED_IMAGE_BUCKET) {
     try {
-      await S3.putObject({
+      const command = new PutObjectCommand({
         Body: transformedImage,
         Bucket: S3_TRANSFORMED_IMAGE_BUCKET,
         Key: originalImagePath + "/" + operationsPrefix,
         ContentType: contentType,
+
         Metadata: {
           "cache-control": TRANSFORMED_IMAGE_CACHE_TTL,
         },
-      }).promise();
+      });
+      await client.send(command);
     } catch (error) {
       console.error(error);
-      console.error("Failed to upload transformed image", originalImagePath);
+      console.error(
+        "[uploadTransformedImage] Failed to upload transformed image",
+        originalImagePath
+      );
       Sentry.captureException(error, {
         extra: {
           file: originalImagePath,
@@ -173,21 +186,23 @@ async function uploadTransformedImage({
   return true;
 }
 
-exports.handler = async (event) => {
-  // First validate if the request is coming from CloudFront
-  if (
-    !event.headers["x-origin-secret-header"] ||
-    !(event.headers["x-origin-secret-header"] === SECRET_KEY)
-  ) {
-    console.error("Incoming request is NOT from Cloudfront");
-    return { message: "Request unauthorized", statusCode: 401 };
-  }
-  // Validate if this is a GET request
-  if (
-    !event.requestContext?.http ||
-    !(event.requestContext.http.method === "GET")
-  ) {
-    return { message: "Only GET method is supported", statusCode: 400 };
+const lambdaCallback = async (event) => {
+  if (shouldValidate) {
+    // First validate if the request is coming from CloudFront
+    if (
+      !event.headers["x-origin-secret-header"] ||
+      !(event.headers["x-origin-secret-header"] === SECRET_KEY)
+    ) {
+      console.error("Incoming request is NOT from Cloudfront");
+      return { message: "Request unauthorized", statusCode: 401 };
+    }
+    // Validate if this is a GET request
+    if (
+      !event.requestContext?.http ||
+      !(event.requestContext.http.method === "GET")
+    ) {
+      return { message: "Only GET method is supported", statusCode: 400 };
+    }
   }
 
   // An example of expected path is /images/rio/1.jpeg/format=auto,width=100 or /images/rio/1.jpeg/original where /images/rio/1.jpeg is the path of the original image
@@ -198,58 +213,63 @@ exports.handler = async (event) => {
   imagePathArray.shift();
   var originalImagePath = imagePathArray.join("/");
 
-  console.log("New request for: " + originalImagePath);
-
-  initS3();
+  console.log("[handler] New request for: " + originalImagePath);
 
   const originalImageResponse = await getOriginalImage(originalImagePath);
   if (!originalImageResponse) {
     return { statusCode: 404 };
   }
-  const { originalImage, contentType } = originalImageResponse;
+  const { originalImage, contentType, presignedUrl } = originalImageResponse;
+
+  console.log("[handler] Content type: " + contentType);
 
   //  execute the requested operations
   const operationsJSON = Object.fromEntries(
     operationsPrefix.split(",").map((operation) => operation.split("="))
   );
 
-  if (originalImagePath.endsWith(".gcode")) {
+  let shouldTransform = contentType !== "binary/octet-stream";
+
+  if (shouldTransform) {
+    const transformedImage = await transformImage({
+      originalImage,
+      operationsJSON,
+      contentType,
+      originalImagePath,
+    });
+    if (!transformedImage) {
+      return {
+        statusCode: 500,
+      };
+    }
+    // upload transformed image back to S3 if required in the architecture
+    await uploadTransformedImage({
+      transformedImage,
+      originalImagePath,
+      operationsPrefix,
+      contentType,
+    });
+    const body = transformedImage.toString("base64");
+    // return transformed image
     return {
       statusCode: 200,
-      body: originalImage.toString("base64"),
+      body,
       isBase64Encoded: true,
       headers: {
         "Content-Type": contentType,
+        "Cache-Control": TRANSFORMED_IMAGE_CACHE_TTL,
+      },
+    };
+  } else {
+    console.log("[handler] presigned url " + presignedUrl);
+    return {
+      statusCode: 301,
+      headers: {
+        // TODO: add fallback for if no presignedUrl
+        location: presignedUrl,
       },
     };
   }
-
-  const transformedImage = await transformImage({
-    originalImage,
-    operationsJSON,
-    contentType,
-    originalImagePath,
-  });
-  if (!transformedImage) {
-    return {
-      statusCode: 500,
-    };
-  }
-  // upload transformed image back to S3 if required in the architecture
-  await uploadTransformedImage({
-    transformedImage,
-    originalImagePath,
-    operationsPrefix,
-    contentType,
-  });
-  // return transformed image
-  return {
-    statusCode: 200,
-    body: transformedImage.toString("base64"),
-    isBase64Encoded: true,
-    headers: {
-      "Content-Type": contentType,
-      "Cache-Control": TRANSFORMED_IMAGE_CACHE_TTL,
-    },
-  };
 };
+
+export const handler = Sentry.AWSLambda.wrapHandler(lambdaCallback);
