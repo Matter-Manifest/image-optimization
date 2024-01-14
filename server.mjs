@@ -19,11 +19,13 @@ const streamToBuffer = (stream) =>
     stream.on("end", () => resolve(Buffer.concat(chunks)));
   });
 
+  /**
+   * THIS IS FOR TESTING
+   */
 const requestListener = async function (req, res) {
   // console.log(await client.config.credentials());
   const command = new GetObjectCommand({
     Bucket: S3_ORIGINAL_IMAGE_BUCKET,
-    // Key: "catalog/Friendly_Articulated_Slug/Ender_3_Pro/PLA/Slug_v1.1_ezbrim_3h26m_0.16mm_205C_PLA_ENDER3PRO.gcode",
     Key: "home/landing-page-learn.png",
   });
   const originalImage = await client.send(command);

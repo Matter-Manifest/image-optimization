@@ -24,6 +24,7 @@ MAKE SURE TO REMEMBER TO USE THE RIGHT AWS PROFILE
 ```
 git clone https://github.com/aws-samples/image-optimization.git 
 cd image-optimization
+npm install -g aws-cdk
 npm install
 cdk bootstrap
 npm run build

@@ -168,6 +168,7 @@ export class ImageOptimizationStack extends Stack {
       environment: lambdaEnv,
       logRetention: logs.RetentionDays.ONE_DAY,
     };
+    
     var imageProcessing = new lambda.Function(
       this,
       "assets-optimization-func",

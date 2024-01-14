@@ -42,11 +42,13 @@ async function getOriginalImage(originalImagePath) {
       Key: originalImagePath,
     });
     const originalImage = await client.send(command);
+    // TODO: can i grab metadata somehow from head
+    
     const contentType = originalImage.ContentType;
     console.log(
       "[getOriginalImage] original image content type:" + contentType
     );
-    if (contentType === "binary/octet-stream") {
+    if (originalImagePath.includes('.stl')  || originalImagePath.includes('.gcode')) {
       // need these for the large files that are bigger than the 6MB limit that lambdas allow for returning data
       presignedUrl = await getSignedUrl(client, command, { expiresIn: 3600 });
     }
@@ -237,7 +239,8 @@ const lambdaCallback = async (event) => {
     operationsPrefix.split(",").map((operation) => operation.split("="))
   );
 
-  let shouldTransform = contentType !== "binary/octet-stream";
+  // To handle the .gcode and .stls
+  let shouldTransform = !originalImagePath.includes('.stl') && !originalImagePath.includes('.gcode');
 
   if (shouldTransform) {
     const transformedImage = await transformImage({
@@ -271,13 +274,19 @@ const lambdaCallback = async (event) => {
     };
   } else {
     console.log("[handler] presigned url " + presignedUrl);
+    if (presignedUrl) {
+      return {
+        statusCode: 301,
+        headers: {
+          location: presignedUrl,
+        },
+      };
+    }
     return {
-      statusCode: 301,
-      headers: {
-        // TODO: add fallback for if no presignedUrl
-        location: presignedUrl,
-      },
-    };
+      statusCode: 500,
+      error: 'Missing presigned'
+    }
+
   }
 };
 
