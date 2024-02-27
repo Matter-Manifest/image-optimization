@@ -1,0 +1,4 @@
+export const S3_ORIGINAL_IMAGE_BUCKET = process.env.S3_ORIGINAL_IMAGE_BUCKET;
+export const S3_TRANSFORMED_IMAGE_BUCKET = process.env.S3_TRANSFORMED_IMAGE_BUCKET;
+export const TRANSFORMED_IMAGE_CACHE_TTL = process.env.TRANSFORMED_IMAGE_CACHE_TTL || '0';
+export const SECRET_KEY = process.env.SECRET_KEY;

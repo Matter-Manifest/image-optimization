@@ -1,0 +1,6 @@
+{
+  "dependencies": {
+    "@sentry/serverless": "^7.103.0",
+    "sharp": "^0.32.6"
+  }
+}
